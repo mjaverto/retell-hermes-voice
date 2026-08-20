@@ -9,7 +9,10 @@ own ``delta_interval_s``/timeout settings require.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
+import logging
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -504,3 +507,148 @@ def test_readyz_503_when_hermes_unhealthy() -> None:
     with TestClient(app) as client:
         response = client.get("/readyz")
         assert response.status_code == 503
+
+
+# --- 15. barge-in: superseded turn teardown never blocks the WS loop --------
+
+
+def test_barge_in_teardown_does_not_block_ws_loop() -> None:
+    """A superseded turn's slow Hermes stop must not delay ping_pong echoes.
+
+    Regression: cancelling the old turn used to be awaited inline, so a slow
+    POST /stop (bounded by hermes_stop_timeout) starved the receive loop past
+    Retell's 5 s ping deadline.
+    """
+    script = FakeScript(deltas=["one", "two", "three"], delta_interval_s=0.2, stop_delay_s=0.5)
+    with running_app(script) as (client, settings, state):
+        secret = settings.route_secret.get_secret_value()
+        with open_call(client, "call-barge", secret) as ws:
+            ws.send_json(call_details_payload(call_id="call-barge", from_number="+15551230000"))
+            recv(ws)  # greeting
+
+            ws.send_json(response_required_payload(1, user_content="Tell me a long story."))
+            first = recv(ws, timeout=2.0)
+            assert first["response_id"] == 1
+
+            ws.send_json(response_required_payload(2, user_content="Actually, stop."))
+            timestamp = 555
+            ws.send_json(ping_pong_payload(timestamp))
+
+            # The echo must arrive before turn 2 completes and while turn 1's
+            # delayed stop is still pending (i.e. teardown was not awaited).
+            saw_echo = False
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                frame = recv(ws, timeout=max(0.05, deadline - time.monotonic()))
+                if frame.get("response_type") == "ping_pong":
+                    saw_echo = True
+                    assert frame["timestamp"] == timestamp
+                    break
+                assert not (frame["response_id"] == 2 and frame["content_complete"]), (
+                    "ping_pong echo must not wait for the new turn to finish"
+                )
+            assert saw_echo
+            assert len(state.stops) == 0, (
+                "turn 1's Hermes stop must still be in flight when the echo arrives"
+            )
+
+            collect_turn(ws, response_id=2, deadline=3.0)
+
+            # Teardown still completes in the background: the stop lands.
+            stop_deadline = time.monotonic() + 3.0
+            while time.monotonic() < stop_deadline and len(state.stops) < 1:
+                time.sleep(0.02)
+            assert len(state.stops) >= 1
+
+
+# --- 16. enforced allowlist: turn before call_details is denied --------------
+
+
+def test_enforced_allowlist_denies_turn_before_call_details() -> None:
+    script = FakeScript(deltas=["must never run"], delta_interval_s=0.0)
+    with running_app(script, allowed_callers=["+15551230000"]) as (client, settings, state):
+        secret = settings.route_secret.get_secret_value()
+        with open_call(client, "call-early-turn", secret) as ws:
+            # response_required arrives before call_details: the allowlist cannot
+            # be checked yet, so the call is denied instead of running a turn.
+            ws.send_json(response_required_payload(1, user_content="Hello?"))
+            denied = recv(ws)
+            assert denied["response_type"] == "response"
+            assert denied["response_id"] == 1
+            assert denied["content"] == DENIED_LINE
+            assert denied["content_complete"] is True
+            assert denied["end_call"] is True
+        assert state.runs == []
+
+
+# --- 17. reminder_required: synthetic nudge instead of stale input -----------
+
+
+def test_reminder_required_runs_turn_with_synthetic_nudge() -> None:
+    script = FakeScript(deltas=["Are you still there?"], delta_interval_s=0.0)
+    with running_app(script) as (client, settings, state):
+        secret = settings.route_secret.get_secret_value()
+        with open_call(client, "call-reminder", secret) as ws:
+            ws.send_json(call_details_payload(call_id="call-reminder", from_number="+15551230000"))
+            recv(ws)  # greeting
+
+            ws.send_json(
+                {
+                    "interaction_type": "reminder_required",
+                    "response_id": 1,
+                    "transcript": [utterance("agent", "How can I help you today?")],
+                }
+            )
+            frames = collect_turn(ws, response_id=1)
+            assert frames[-1]["content_complete"] is True
+
+        assert len(state.runs) == 1
+        assert "gone quiet" in state.runs[-1]["body"]["input"]
+
+
+# --- 18. ttfb log: sane, single-clock value ----------------------------------
+
+
+def test_ttfb_log_reports_sane_monotonic_value(caplog: pytest.LogCaptureFixture) -> None:
+    script = FakeScript(deltas=["hi there"], delta_interval_s=0.0)
+    with (
+        caplog.at_level(logging.INFO, logger="retell_hermes_voice.call_session"),
+        running_app(script) as (client, settings, _state),
+    ):
+        secret = settings.route_secret.get_secret_value()
+        with open_call(client, "call-ttfb", secret) as ws:
+            ws.send_json(call_details_payload(call_id="call-ttfb", from_number="+15551230000"))
+            recv(ws)  # greeting
+            ws.send_json(response_required_payload(1, user_content="Quick one."))
+            collect_turn(ws, response_id=1)
+    first_delta_messages = [
+        record.getMessage() for record in caplog.records if "first_delta" in record.getMessage()
+    ]
+    assert first_delta_messages
+    match = re.search(r"ttfb_ms=(-?\d+)", first_delta_messages[0])
+    assert match is not None
+    ttfb_ms = int(match.group(1))
+    # Mixing loop.time() with time.monotonic() yields garbage (huge or negative)
+    # under uvloop; an in-process turn against the fake stays well under 5 s.
+    assert 0 <= ttfb_ms < 5000
+
+
+# --- 19. denied-call logs: hashed ref only, never the raw call id ------------
+
+
+def test_denied_call_logs_hash_ref_never_raw_call_id(caplog: pytest.LogCaptureFixture) -> None:
+    script = FakeScript(deltas=[], delta_interval_s=0.0)
+    call_id = "call-raw-secret-xyz-987"
+    expected_ref = hashlib.sha256(call_id.encode()).hexdigest()[:12]
+    with (
+        caplog.at_level(logging.INFO),
+        running_app(script, allowed_callers=["+15551230000"]) as (client, settings, _state),
+    ):
+        secret = settings.route_secret.get_secret_value()
+        with open_call(client, call_id, secret) as ws:
+            ws.send_json(call_details_payload(call_id=call_id, from_number="+15559999999"))
+            denied = recv(ws)
+            assert denied["content"] == DENIED_LINE
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(expected_ref in message for message in messages)
+    assert all(call_id not in message for message in messages)

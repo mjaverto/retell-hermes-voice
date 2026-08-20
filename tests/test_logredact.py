@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Iterator
 
@@ -68,6 +69,25 @@ class TestRedactionFilter:
         record = _record(f"value={FAKE_SECRET}")
         filt.filter(record)
         assert "[REDACTED]" in record.getMessage()
+
+    def test_bad_percent_format_does_not_raise_and_still_scrubs(self) -> None:
+        filt = RedactionFilter([FAKE_SECRET])
+        record = _record(f"val={FAKE_SECRET} n=%d", ("not-a-number",))
+        assert filt.filter(record) is True
+        message = record.getMessage()
+        assert FAKE_SECRET not in message
+        assert "[REDACTED]" in message
+        assert record.args is None
+
+    def test_ws_path_secret_and_call_id_rewritten(self) -> None:
+        filt = RedactionFilter([])
+        record = _record('connection accepted "/llm-websocket/supersecretvalue123456/call-abc"')
+        filt.filter(record)
+        message = record.getMessage()
+        assert "supersecretvalue123456" not in message
+        assert "call-abc" not in message
+        expected_ref = hashlib.sha256(b"call-abc").hexdigest()[:12]
+        assert f"/llm-websocket/[REDACTED]/{expected_ref}" in message
 
 
 def _settings() -> Settings:

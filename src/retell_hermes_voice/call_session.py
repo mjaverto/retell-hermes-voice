@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import secrets
 import time
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 DENIED_LINE = "Sorry, this number isn't available. Goodbye."
 APOLOGY_LINE = "Sorry, I'm having trouble right now. Could you say that again?"
 
+# Synthetic turn input for reminder_required: the caller went silent, so there is
+# no new utterance to answer; Hermes gets an explicit nudge instruction instead.
+REMINDER_NUDGE = (
+    "The caller has gone quiet. Briefly and naturally check in with them "
+    "or continue helping based on the conversation so far."
+)
+
 
 class CallSession:
     """Owns one WebSocket = one call.
@@ -53,7 +61,8 @@ class CallSession:
         hermes: HermesClient,
         send: Callable[[str], Awaitable[None]],
     ) -> None:
-        self._call_id = call_id
+        # Logs identify the call only by this truncated hash (docs/security.md).
+        self._call_ref = hashlib.sha256(call_id.encode()).hexdigest()[:12]
         self._settings = settings
         self._hermes = hermes
         self._send = send
@@ -69,7 +78,9 @@ class CallSession:
         self.turns: int = 0
         self.outcome: str = "open"
         self._turn_task: asyncio.Task[None] | None = None
+        self._reaping: set[asyncio.Task[None]] = set()
         self._greeted = False
+        self._details_seen = False
         self._denied = False
         self._closed = False
         self._direction: Literal["inbound", "outbound"] = "inbound"
@@ -92,15 +103,24 @@ class CallSession:
             return
 
     async def close(self) -> None:
-        """Cancel any in-flight turn (stopping the Hermes run). Idempotent."""
+        """Cancel any in-flight turn and await Hermes stop completion. Idempotent."""
         if self._closed:
             return
         self._closed = True
         if self.outcome == "open":
             self.outcome = "closed"
-        await self._cancel_turn_task()
+        self._cancel_turn_task()
+        if self._reaping:
+            # Barge-ins leave superseded turns tearing down in the background;
+            # shutdown still guarantees every Hermes stop has completed.
+            await asyncio.gather(*list(self._reaping), return_exceptions=True)
 
     async def _handle_call_details(self, event: CallDetailsEvent) -> None:
+        self._details_seen = True
+        if self._denied:
+            # Already denied (e.g. a turn arrived before details under an
+            # enforced allowlist); never greet after asking Retell to end.
+            return
         call: dict[str, Any] = event.call if isinstance(event.call, dict) else {}
         self._direction = "outbound" if call.get("direction") == "outbound" else "inbound"
         raw_from = call.get("from_number")
@@ -109,8 +129,8 @@ class CallSession:
             self._denied = True
             self.outcome = "denied"
             logger.info(
-                "call denied call_id=%s from=%s outcome=denied",
-                self._call_id,
+                "call denied call=%s from=%s outcome=denied",
+                self._call_ref,
                 redact_phone(self._from_number) if self._from_number else "unknown",
             )
             await self._send_event(
@@ -132,22 +152,65 @@ class CallSession:
     async def _handle_response_required(self, event: ResponseRequiredEvent) -> None:
         if self._denied or event.response_id <= self.latest_response_id:
             return
+        if self._policy.enforced and not self._details_seen:
+            # An enforced allowlist cannot be checked before call_details arrives,
+            # so a turn requested this early is denied rather than run for a
+            # possibly unauthorized caller. Without enforcement, a pre-details
+            # turn runs as before.
+            self._denied = True
+            self.outcome = "denied"
+            self.latest_response_id = event.response_id
+            logger.info(
+                "call denied call=%s reason=turn_before_details outcome=denied", self._call_ref
+            )
+            await self._send_event(
+                ResponseOut(
+                    response_id=event.response_id,
+                    content=DENIED_LINE,
+                    content_complete=True,
+                    end_call=True,
+                )
+            )
+            return
         self.latest_response_id = event.response_id
         self.turns += 1
         received_at = time.monotonic()
-        await self._cancel_turn_task()
+        self._cancel_turn_task()
         self._turn_task = asyncio.create_task(
             self._run_turn(event, received_at), name=f"rhv-turn-{event.response_id}"
         )
 
-    async def _cancel_turn_task(self) -> None:
+    def _cancel_turn_task(self) -> None:
+        """Cancel the in-flight turn without awaiting its teardown.
+
+        The cancelled task's cleanup (generator aclose -> Hermes stop, bounded by
+        ``hermes_stop_timeout``) finishes in the background so the WS receive loop
+        keeps answering ping_pong within Retell's 5 s window. The superseded
+        Hermes run may briefly overlap the new turn's run while it stops; that is
+        acceptable (docs/integration-contracts.md) and harmless: the runs have
+        distinct run_ids and the ``latest_response_id`` guard keeps the dying turn
+        from emitting frames. ``close()`` awaits ``self._reaping`` so shutdown
+        still waits for every stop.
+        """
         task = self._turn_task
         self._turn_task = None
         if task is None or task.done():
             return
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        self._reaping.add(task)
+        task.add_done_callback(self._reap)
+
+    def _reap(self, task: asyncio.Task[None]) -> None:
+        self._reaping.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                "superseded turn teardown failed call=%s error=%s",
+                self._call_ref,
+                type(exc).__name__,
+            )
 
     async def _run_turn(self, event: ResponseRequiredEvent, received_at: float) -> None:
         response_id = event.response_id
@@ -161,7 +224,12 @@ class CallSession:
             transcript = truncate_transcript(event.transcript, settings.max_transcript_utterances)
             history = map_transcript(transcript)
             user_input = ""
-            if history and history[-1]["role"] == "user":
+            if event.is_reminder:
+                # reminder_required fires when the caller goes quiet: there is no
+                # new user utterance to answer, so the whole transcript stays in
+                # history and Hermes gets an explicit nudge instruction instead.
+                user_input = REMINDER_NUDGE
+            elif history and history[-1]["role"] == "user":
                 # The trailing user utterance is the turn input, not history.
                 user_input = history[-1]["content"]
                 history = history[:-1]
@@ -217,10 +285,12 @@ class CallSession:
                         last_emit_at = now
                         if not emitted_delta:
                             emitted_delta = True
-                            ttfb_ms = int((now - received_at) * 1000)
+                            # received_at is time.monotonic(); never mix in
+                            # loop.time() (a different clock under uvloop).
+                            ttfb_ms = int((time.monotonic() - received_at) * 1000)
                             logger.info(
                                 "turn first_delta call=%s turn=%d ttfb_ms=%d",
-                                self.session_id,
+                                self._call_ref,
                                 response_id,
                                 ttfb_ms,
                             )
@@ -247,7 +317,7 @@ class CallSession:
             raise
         except Exception:
             outcome = "failed"
-            logger.exception("turn failed call=%s turn=%d", self.session_id, response_id)
+            logger.exception("turn failed call=%s turn=%d", self._call_ref, response_id)
             if response_id == self.latest_response_id and not self._closed:
                 with contextlib.suppress(Exception):
                     await self._send_event(
@@ -259,8 +329,18 @@ class CallSession:
             if next_task is not None and not next_task.done():
                 next_task.cancel()
             if next_task is not None:
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                try:
                     await next_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                except Exception as exc:
+                    # A real anext() bug must not vanish silently into teardown.
+                    logger.warning(
+                        "turn event fetch failed in teardown call=%s turn=%d error=%s",
+                        self._call_ref,
+                        response_id,
+                        type(exc).__name__,
+                    )
             if agen is not None:
                 # Mandatory: closing the generator triggers the Hermes run stop.
                 with contextlib.suppress(Exception):
@@ -268,7 +348,7 @@ class CallSession:
             total_ms = int((time.monotonic() - received_at) * 1000)
             logger.info(
                 "turn end call=%s turn=%d ttfb_ms=%s total_ms=%d outcome=%s",
-                self.session_id,
+                self._call_ref,
                 response_id,
                 ttfb_ms if ttfb_ms is not None else "-",
                 total_ms,
@@ -294,7 +374,7 @@ class CallSession:
             self._tool_budget_warned = True
             logger.warning(
                 "tool budget exceeded call=%s used_s=%.1f budget_s=%.1f",
-                self.session_id,
+                self._call_ref,
                 self._tool_seconds_used,
                 budget,
             )

@@ -39,10 +39,15 @@ def _split_csv(value: object) -> object:
 class ToolPolicy(BaseModel):
     """Which Hermes tools voice turns may use, and their budgets."""
 
-    enabled_tools: list[str] = []
-    confirm_tools: list[str] = []
+    enabled_tools: Annotated[list[str], NoDecode] = []
+    confirm_tools: Annotated[list[str], NoDecode] = []
     max_tool_calls_per_turn: int = 3
     max_tool_seconds_per_call: float = 60.0
+
+    @field_validator("enabled_tools", "confirm_tools", mode="before")
+    @classmethod
+    def _parse_csv(cls, value: object) -> object:
+        return _split_csv(value)
 
 
 class Settings(BaseSettings):
@@ -92,7 +97,6 @@ class Settings(BaseSettings):
     max_ws_message_bytes: int = 1_000_000
     session_retention: Literal["none", "hermes"] = "none"
     tool_policy: ToolPolicy = ToolPolicy()
-    log_transcripts: bool = False
 
     @field_validator("allowed_callers", "filler_phrases", mode="before")
     @classmethod

@@ -154,8 +154,8 @@ Logging is structured `key=value` to stderr — under systemd it lands in journa
 journalctl -u retell-hermes-voice -f
 ```
 
-Secrets and phone numbers are redacted at the logging layer; transcripts are not
-logged unless `RHV_LOG_TRANSCRIPTS=true`. The fields worth graphing are the
+Secrets and phone numbers are redacted at the logging layer; transcript content
+is never logged. The fields worth graphing are the
 per-turn latency figures **`ttfb_ms`** (time to first speakable token — the number
 callers feel; routed models measured at 0.605 s median vs ~3.0 s default) and
 **`total_ms`** (full turn wall time). Alert on `ttfb_ms` creeping toward

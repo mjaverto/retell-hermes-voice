@@ -19,8 +19,7 @@ if TYPE_CHECKING:
 _SKIP_CODE_SENTENCE = "I'll skip the technical details."
 _LINK_SENTENCE = "a link I can send you"
 
-_FENCE_BLOCK_RE = re.compile(r"```[^\n]*\n?.*?```", re.DOTALL)
-_LINK_RE = re.compile(r"!?\[([^\]]*)\]\(([^)]*)\)")
+_LINK_RE = re.compile(r"!?\[([^\]]*)\]\(([^)\n]{0,2048})\)")
 _URL_RE = re.compile(r"https?://\S+")
 _BOLD_STARS_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _BOLD_UNDERS_RE = re.compile(r"__(.+?)__", re.DOTALL)
@@ -34,6 +33,13 @@ _HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
 _TABLE_SEP_RE = re.compile(r"[\s|:\-]+")
 _WS_RE = re.compile(r"\s+")
 _SENTENCE_END = (".", "!", "?", ":", ";", ",")
+
+# TTS of more than ~8KB of text is minutes of speech nobody will sit through, and
+# sanitizing unbounded input can block the event loop (the regex passes below are
+# linear, but linear over megabytes is still milliseconds we don't owe an attacker).
+# Inputs longer than this are truncated with a spoken hand-off sentence.
+MAX_SPOKEN_INPUT = 8192
+_TRUNCATION_SENTENCE = "And there is more detail I can share if you want."
 
 _EMOJI_RE = re.compile(
     "["
@@ -61,23 +67,43 @@ def _ensure_period(text: str) -> str:
     return text + "."
 
 
+def _truncate_spoken(text: str) -> str:
+    """Cap input at ``MAX_SPOKEN_INPUT`` chars, ending with a spoken hand-off sentence.
+
+    The truncated result is itself under the cap, so re-truncating is a no-op and
+    :func:`sanitize_spoken` stays idempotent.
+    """
+    if len(text) <= MAX_SPOKEN_INPUT:
+        return text
+    # budget: kept text + possible _ensure_period char + space + sentence <= cap
+    keep = MAX_SPOKEN_INPUT - len(_TRUNCATION_SENTENCE) - 2
+    return _ensure_period(text[:keep].rstrip()) + " " + _TRUNCATION_SENTENCE
+
+
 def _strip_fences(text: str) -> str:
-    """Drop fenced code blocks; mention the omission once per document."""
+    """Drop fenced code blocks; mention the omission once per document.
+
+    Pairs ``\\`\\`\\``` markers with a linear ``str.find`` scan (a DOTALL regex here
+    backtracks quadratically on marker-dense adversarial input).
+    """
+    parts: list[str] = []
     replaced = False
-
-    def repl(_match: re.Match[str]) -> str:
-        nonlocal replaced
-        if replaced:
-            return " "
+    pos = 0
+    while True:
+        start = text.find("```", pos)
+        if start == -1:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos:start])
+        end = text.find("```", start + 3)
+        if end == -1:  # unterminated fence: everything after it is code
+            if not replaced:
+                parts.append(f" {_SKIP_CODE_SENTENCE}")
+            break
+        parts.append(" " if replaced else f" {_SKIP_CODE_SENTENCE} ")
         replaced = True
-        return f" {_SKIP_CODE_SENTENCE} "
-
-    text = _FENCE_BLOCK_RE.sub(repl, text)
-    idx = text.find("```")
-    if idx != -1:  # unterminated fence: everything after it is code
-        tail = "" if replaced else f" {_SKIP_CODE_SENTENCE}"
-        text = text[:idx] + tail
-    return text
+        pos = end + 3
+    return "".join(parts)
 
 
 def _flatten_lines(text: str) -> str:
@@ -109,7 +135,12 @@ def _flatten_lines(text: str) -> str:
 
 
 def sanitize_spoken(text: str) -> str:
-    """Markdown/emoji/code/URL-noise -> speakable prose. Idempotent."""
+    """Markdown/emoji/code/URL-noise -> speakable prose. Idempotent.
+
+    Input beyond ``MAX_SPOKEN_INPUT`` chars is truncated first (see the constant's
+    rationale) with a spoken hand-off sentence appended.
+    """
+    text = _truncate_spoken(text)
     text = html.unescape(text)
     text = _strip_fences(text)
     text = _flatten_lines(text)

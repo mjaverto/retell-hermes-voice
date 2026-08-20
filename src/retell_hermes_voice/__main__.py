@@ -17,6 +17,9 @@ def main() -> None:
         host=settings.listen_host,
         port=settings.listen_port,
         log_config=None,
+        # First line of defense: oversized frames are rejected at the transport
+        # before buffering; parse_inbound re-checks the same limit in-app.
+        ws_max_size=settings.max_ws_message_bytes,
     )
 
 

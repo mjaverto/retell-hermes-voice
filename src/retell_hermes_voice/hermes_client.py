@@ -40,13 +40,19 @@ SAFE_ERROR_MESSAGE = "Sorry, I ran into a problem with that. Could you say that 
 # unknown provider -- both fail open as HTTP 200"): Hermes returns a *successful* run
 # whose assistant content IS the error text (with zero usage), e.g.
 # "\u26a0\ufe0f Provider authentication failed: Unknown provider 'not-a-provider'. ...".
-# A naive adapter would read that aloud. Any delta/done text starting with one of these
-# prefixes is treated as a failed turn and replaced with a safe message.
-ERROR_CONTENT_PREFIXES: tuple[str, ...] = (
+# A naive adapter would read that aloud. Candidate text is normalized with
+# ``lstrip().casefold()`` before prefix comparison; the prefixes below are stored
+# casefolded. Two tiers:
+# - DEFINITE: unmistakable fail-open signatures -> failed turn immediately.
+# - AMBIGUOUS: "error:" can open a legitimate answer, so it only counts as a failure
+#   when the run also terminates with zero/absent usage tokens -- the live fail-open
+#   signature (run.completed carries usage, integration-contracts.md section 2.4).
+DEFINITE_ERROR_PREFIXES: tuple[str, ...] = (
     "\u26a0\ufe0f",  # warning-sign emoji prefix on provider auth failures
-    "Provider authentication failed",
-    "Error:",
+    "provider authentication failed",
 )
+AMBIGUOUS_ERROR_PREFIXES: tuple[str, ...] = ("error:",)
+_ALL_ERROR_PREFIXES: tuple[str, ...] = DEFINITE_ERROR_PREFIXES + AMBIGUOUS_ERROR_PREFIXES
 
 # Text deltas arrive as "message.delta" on the live /v1/runs stream (hermes-contract.md
 # section 1.2); "assistant.delta" / "response.output_text.delta" style names are handled
@@ -66,18 +72,44 @@ class HermesUnavailableError(Exception):
     """Hermes could not be reached at all (connection-level failure)."""
 
 
-def _classify_error_prefix(text: str) -> Literal["error", "ambiguous", "clean"]:
+def _classify_error_prefix(text: str) -> Literal["error", "suspect", "undecided", "clean"]:
     """Classify text against the known fail-open error prefixes.
 
-    "ambiguous" means the text is still a proper prefix of one of the error prefixes,
-    so there are not enough characters yet to rule the error out (token-level deltas
-    can split a prefix across chunks).
+    Candidate text is normalized with ``lstrip().casefold()`` so leading whitespace or
+    casing differences cannot dodge detection. Verdicts:
+
+    - "error": starts with a definite fail-open prefix.
+    - "suspect": starts with an ambiguous prefix ("error:"); a failure only when the
+      terminal event corroborates it with zero/absent usage.
+    - "undecided": still a proper prefix of one of the error prefixes, so there are
+      not enough characters yet to rule an error out (token-level deltas can split a
+      prefix across chunks).
+    - "clean": provably none of the above.
     """
-    if any(text.startswith(prefix) for prefix in ERROR_CONTENT_PREFIXES):
+    normalized = text.lstrip().casefold()
+    if any(normalized.startswith(prefix) for prefix in DEFINITE_ERROR_PREFIXES):
         return "error"
-    if any(prefix.startswith(text) for prefix in ERROR_CONTENT_PREFIXES):
-        return "ambiguous"
+    if any(normalized.startswith(prefix) for prefix in AMBIGUOUS_ERROR_PREFIXES):
+        return "suspect"
+    if any(prefix.startswith(normalized) for prefix in _ALL_ERROR_PREFIXES):
+        return "undecided"
     return "clean"
+
+
+def _zero_or_absent_usage(payload: Mapping[str, Any]) -> bool:
+    """True when a terminal event's usage is zero or absent.
+
+    Zero/absent usage is the live fail-open signature (integration-contracts.md
+    section 2.4); it corroborates suspect "error:"-prefixed content. A missing or
+    malformed usage field counts as corroboration.
+    """
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return True
+    total = usage.get("total_tokens")
+    if isinstance(total, int | float):
+        return total == 0
+    return True
 
 
 def _extract_text(payload: Mapping[str, Any], keys: tuple[str, ...]) -> str:
@@ -89,9 +121,8 @@ def _extract_text(payload: Mapping[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _parse_sse_json(data_lines: list[str]) -> dict[str, Any] | None:
-    """Join accumulated SSE ``data:`` lines and parse them as a JSON object."""
-    raw = "\n".join(data_lines).strip()
+def _parse_sse_json(raw: str) -> dict[str, Any] | None:
+    """Parse joined SSE ``data:`` frame content as a JSON object."""
     if not raw or raw == "[DONE]":
         return None
     parsed: Any
@@ -142,18 +173,26 @@ class HermesClient:
         """``GET /health``: True iff HTTP 200 with ``status: ok``.
 
         Raises :class:`HermesUnavailableError` when Hermes cannot be reached at all.
+        Every failure path logs a warning (never the response body) so /readyz
+        callers keep a diagnostic trail.
         """
         try:
             response = await self._client.get("/health")
         except httpx.HTTPError as exc:
+            logger.warning("hermes health check failed error=%s", type(exc).__name__)
             raise HermesUnavailableError("Hermes API server is unreachable") from exc
         if response.status_code != 200:
+            logger.warning("hermes health check failed status=%s", response.status_code)
             return False
         try:
             payload = response.json()
-        except ValueError:
+        except ValueError as exc:
+            logger.warning("hermes health check body undecodable error=%s", type(exc).__name__)
             return False
-        return isinstance(payload, dict) and payload.get("status") == "ok"
+        if isinstance(payload, dict) and payload.get("status") == "ok":
+            return True
+        logger.warning("hermes health check returned unexpected payload")
+        return False
 
     async def warmup(self) -> None:
         """Fire one tiny run with voice routing applied to warm provider clients.
@@ -284,6 +323,7 @@ class HermesClient:
                 got_first_delta = False
                 decided_clean = False  # held-back text proven not to be an error body
                 pending = ""  # text held back until decided_clean
+                dropped_frames = 0  # undecodable/nameless SSE frames (telemetry only)
                 event_name = ""
                 data_lines: list[str] = []
                 eof = False
@@ -323,7 +363,8 @@ class HermesClient:
                     elif line != "":
                         continue  # unknown SSE field -> ignore
 
-                    payload = _parse_sse_json(data_lines)
+                    raw_data = "\n".join(data_lines).strip()
+                    payload = _parse_sse_json(raw_data)
                     name = event_name
                     event_name = ""
                     data_lines = []
@@ -334,6 +375,17 @@ class HermesClient:
                         if isinstance(raw_name, str):
                             name = raw_name
                     if payload is None or not name:
+                        if raw_data and raw_data != "[DONE]":
+                            # Undecodable or nameless frame: count it; never log content.
+                            dropped_frames += 1
+                            if dropped_frames == 1:
+                                logger.warning("unrecognized SSE frame run_id=%s", run_id)
+                            else:
+                                logger.debug(
+                                    "unrecognized SSE frame run_id=%s dropped=%d",
+                                    run_id,
+                                    dropped_frames,
+                                )
                         continue
 
                     if name in _DELTA_EVENT_NAMES:
@@ -356,7 +408,7 @@ class HermesClient:
                             decided_clean = True
                             yield HermesTurnEvent(kind="delta", text=pending)
                             pending = ""
-                        # "ambiguous": hold back until more text arrives.
+                        # "suspect"/"undecided": hold back until more text or terminal.
                     elif name in _TOOL_START_EVENT_NAMES:
                         if name == "hermes.tool.progress" and payload.get("status") == "completed":
                             continue  # tool end, not a start
@@ -368,10 +420,20 @@ class HermesClient:
                     elif name == "run.completed":
                         terminal = True
                         final_text = _extract_text(payload, _DONE_TEXT_KEYS)
-                        if (
-                            _classify_error_prefix(final_text) == "error"
-                            or _classify_error_prefix(pending) == "error"
+                        final_verdict = _classify_error_prefix(final_text)
+                        pending_verdict = _classify_error_prefix(pending)
+                        if final_verdict == "error" or pending_verdict == "error":
+                            logger.warning(
+                                "hermes fail-open error content intercepted run_id=%s", run_id
+                            )
+                            yield HermesTurnEvent(kind="error", text=SAFE_ERROR_MESSAGE)
+                            return
+                        if "suspect" in (final_verdict, pending_verdict) and _zero_or_absent_usage(
+                            payload
                         ):
+                            # "error:"-prefixed content corroborated by the fail-open
+                            # usage signature; a real answer that merely opens with
+                            # "Error:" carries nonzero usage and is released below.
                             logger.warning(
                                 "hermes fail-open error content intercepted run_id=%s", run_id
                             )
@@ -381,6 +443,12 @@ class HermesClient:
                             # Held-back text turned out to be harmless; flush it.
                             yield HermesTurnEvent(kind="delta", text=pending)
                             pending = ""
+                        if dropped_frames:
+                            logger.debug(
+                                "hermes turn completed run_id=%s dropped_frames=%d",
+                                run_id,
+                                dropped_frames,
+                            )
                         yield HermesTurnEvent(kind="done", text=final_text)
                         return
                     elif name == "run.failed":
@@ -416,11 +484,25 @@ class HermesClient:
         Runs inside generator finalization: every exception -- including a
         cancellation delivered while awaiting -- is swallowed so cleanup can never
         mask the original exit reason or leave the caller's teardown hanging.
+        A 404 means the run already finished (stopping races completion, contract
+        section 1.4) and is expected; it is logged at debug only.
         """
         try:
-            await asyncio.wait_for(
+            response = await asyncio.wait_for(
                 self._client.post(f"/v1/runs/{run_id}/stop"),
                 timeout=self._settings.hermes_stop_timeout,
             )
-        except (asyncio.CancelledError, Exception):  # deliberate blanket swallow in cleanup
-            logger.warning("failed to stop hermes run run_id=%s", run_id)
+        except (asyncio.CancelledError, Exception) as exc:
+            # Deliberate blanket swallow in cleanup.
+            logger.warning(
+                "failed to stop hermes run run_id=%s error=%s", run_id, type(exc).__name__
+            )
+            return
+        if 200 <= response.status_code < 300:
+            logger.debug("stopped hermes run run_id=%s status=%s", run_id, response.status_code)
+        elif response.status_code == 404:
+            logger.debug("hermes run already finished run_id=%s", run_id)
+        else:
+            logger.warning(
+                "hermes run stop failed run_id=%s status=%s", run_id, response.status_code
+            )

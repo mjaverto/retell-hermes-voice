@@ -49,7 +49,6 @@ class Settings(BaseSettings):
     max_ws_message_bytes: int = 1_000_000
     session_retention: Literal["none", "hermes"] = "none"  # "none": per-call random session ids
     tool_policy: ToolPolicy = ToolPolicy()
-    log_transcripts: bool = False           # default: never log content
 
 def get_settings() -> Settings   # lru_cache'd
 ```
@@ -235,7 +234,7 @@ app = create_app(settings)   # factory
 #   WS  /llm-websocket/{route_secret}/{call_id}
 # WS handshake: secrets.compare_digest on route_secret -> mismatch: close(code=1008) before accept... 
 #   (accept-then-close-1008 acceptable if starlette requires accept first; do NOT process events).
-# Global semaphore max_concurrent_calls: full -> accept, speak configured "busy" line, end_call=True.
+# Global concurrent-call cap max_concurrent_calls: full -> accept, speak configured "busy" line, end_call=True.
 # Per-message size check BEFORE json parse; oversized/malformed -> log + ignore frame (protocol says
 #   Retell fails silently; never crash the call). 3 consecutive malformed frames -> close 1008.
 # Lifespan: build HermesClient once; optional warmup task; graceful shutdown: close sessions

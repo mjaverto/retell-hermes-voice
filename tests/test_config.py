@@ -96,6 +96,21 @@ def test_tool_policy_nested_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.tool_policy.max_tool_calls_per_turn == 5
 
 
+def test_tool_policy_list_env_comma_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(
+        monkeypatch,
+        RHV_TOOL_POLICY__ENABLED_TOOLS="recall,weather",
+        RHV_TOOL_POLICY__CONFIRM_TOOLS="send_email, delete_file",
+    )
+    assert settings.tool_policy.enabled_tools == ["recall", "weather"]
+    assert settings.tool_policy.confirm_tools == ["send_email", "delete_file"]
+
+
+def test_tool_policy_list_env_json_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(monkeypatch, RHV_TOOL_POLICY__ENABLED_TOOLS='["recall", "weather"]')
+    assert settings.tool_policy.enabled_tools == ["recall", "weather"]
+
+
 def test_get_settings_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, value in REQUIRED_ENV.items():
         monkeypatch.setenv(key, value)

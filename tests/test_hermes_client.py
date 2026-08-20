@@ -8,6 +8,7 @@ asyncio deadlines around the SSE subscribe itself.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
@@ -273,3 +274,130 @@ async def test_warmup_swallows_errors() -> None:
     finally:
         await client.aclose()
     assert state.runs == []
+
+
+async def abort_after_first_delta(client: HermesClient) -> None:
+    """Consume one delta then abandon the turn, forcing the stop path."""
+    agen = client.run_turn(**turn_args())
+    async for event in agen:
+        if event.kind == "delta":
+            break
+    await agen.aclose()
+
+
+async def test_stop_non_2xx_logs_warning_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, state = make_client(
+        FakeScript(deltas=["one", "two"], delta_interval_s=0.0, fail_stop=500)
+    )
+    caplog.set_level(logging.WARNING, logger="retell_hermes_voice.hermes_client")
+    try:
+        await abort_after_first_delta(client)  # must not raise despite the 500
+    finally:
+        await client.aclose()
+    assert len(state.stops) == 1
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "500" in warnings[0].getMessage()
+    assert state.stops[0]["run_id"] in warnings[0].getMessage()
+
+
+async def test_stop_404_is_quiet(caplog: pytest.LogCaptureFixture) -> None:
+    client, state = make_client(
+        FakeScript(deltas=["one", "two"], delta_interval_s=0.0, fail_stop=404)
+    )
+    caplog.set_level(logging.DEBUG, logger="retell_hermes_voice.hermes_client")
+    try:
+        await abort_after_first_delta(client)
+    finally:
+        await client.aclose()
+    assert len(state.stops) == 1
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert any("already finished" in r.getMessage() for r in caplog.records)
+
+
+async def test_stop_failure_log_names_exception_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, state = make_client(
+        FakeScript(deltas=["one", "two"], delta_interval_s=0.0, hang_stop=True),
+        hermes_stop_timeout=0.05,
+    )
+    caplog.set_level(logging.WARNING, logger="retell_hermes_voice.hermes_client")
+    try:
+        await abort_after_first_delta(client)  # stop hangs; wait_for must cut it off
+    finally:
+        await client.aclose()
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("failed to stop hermes run" in m and "TimeoutError" in m for m in messages)
+
+
+async def test_error_content_casefold_and_whitespace_intercepted() -> None:
+    raw = "  PROVIDER AUTHENTICATION FAILED: Unknown provider 'nope'."
+    client, state = make_client(FakeScript(deltas=[], error_content=raw))
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["error"]
+    for event in events:
+        assert "PROVIDER AUTHENTICATION FAILED" not in event.text
+
+
+async def test_error_prefix_with_zero_usage_intercepted() -> None:
+    raw = "  ERROR: cannot reach provider"
+    client, state = make_client(FakeScript(deltas=[], error_content=raw))  # zero usage
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["error"]
+    for event in events:
+        assert "cannot reach provider" not in event.text
+
+
+async def test_error_prefixed_answer_with_nonzero_usage_released() -> None:
+    raw = "Error: 418 brewing"
+    client, state = make_client(
+        FakeScript(
+            deltas=[],
+            error_content=raw,
+            completed_usage={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+        )
+    )
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["delta", "done"]
+    assert events[0].text == raw  # held-back text released verbatim
+    assert events[1].text == raw
+
+
+async def test_unknown_sse_frame_warns_once_and_stream_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, state = make_client(
+        FakeScript(
+            deltas=["ok"],
+            delta_interval_s=0.0,
+            pre_frames=[
+                "data: this is not json\n\n",  # undecodable
+                'data: {"payload": "but no event name"}\n\n',  # nameless
+            ],
+        )
+    )
+    caplog.set_level(logging.DEBUG, logger="retell_hermes_voice.hermes_client")
+    try:
+        events = await drain(client)
+    finally:
+        await client.aclose()
+    assert [event.kind for event in events] == ["delta", "done"]  # stream survived
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "unrecognized SSE frame" in r.getMessage()
+    ]
+    assert len(warnings) == 1  # first occurrence only; the second drop is debug
+    assert "not json" not in caplog.text  # frame content never logged

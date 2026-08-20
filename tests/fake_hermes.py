@@ -33,6 +33,11 @@ class FakeScript:
     hang_after: int | None = None  # stop emitting after N deltas, keep the stream open
     error_content: str | None = None  # emit as a single delta (fail-open error body)
     fail_create: int | None = None  # HTTP status to return from POST /v1/runs
+    completed_usage: dict[str, Any] | None = None  # overrides usage on run.completed
+    pre_frames: list[str] = field(default_factory=list)  # raw SSE text emitted first
+    fail_stop: int | None = None  # HTTP status to return from POST /v1/runs/{id}/stop
+    hang_stop: bool = False  # never answer POST /v1/runs/{id}/stop
+    stop_delay_s: float = 0.0  # delay before recording/answering a stop
 
 
 @dataclass
@@ -59,6 +64,8 @@ def build_fake_hermes(script: FakeScript) -> tuple[FastAPI, FakeHermesState]:
         await asyncio.Event().wait()
 
     async def _events(run_id: str) -> AsyncIterator[str]:
+        for pre_frame in script.pre_frames:
+            yield pre_frame
         if script.error_content is not None:
             yield _frame(
                 {
@@ -74,7 +81,9 @@ def build_fake_hermes(script: FakeScript) -> tuple[FastAPI, FakeHermesState]:
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "output": script.error_content,
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    "usage": script.completed_usage
+                    if script.completed_usage is not None
+                    else {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                 }
             )
             yield ": stream closed\n\n"
@@ -114,7 +123,9 @@ def build_fake_hermes(script: FakeScript) -> tuple[FastAPI, FakeHermesState]:
                 "run_id": run_id,
                 "timestamp": time.time(),
                 "output": emitted,
-                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                "usage": script.completed_usage
+                if script.completed_usage is not None
+                else {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
             }
         )
         yield ": stream closed\n\n"
@@ -161,7 +172,16 @@ def build_fake_hermes(script: FakeScript) -> tuple[FastAPI, FakeHermesState]:
 
     @app.post("/v1/runs/{run_id}/stop")
     async def stop_run(run_id: str) -> JSONResponse:
+        if script.stop_delay_s > 0:
+            await asyncio.sleep(script.stop_delay_s)
+        if script.hang_stop:
+            await asyncio.Event().wait()
         state.stops.append({"run_id": run_id, "time": time.monotonic()})
+        if script.fail_stop is not None:
+            return JSONResponse(
+                {"error": {"message": "stop rejected", "type": "test_error"}},
+                status_code=script.fail_stop,
+            )
         return JSONResponse({"run_id": run_id, "status": "stopping"})
 
     return app, state

@@ -225,7 +225,7 @@ All settings load from `RHV_`-prefixed environment variables or a `.env` file
 | `RHV_HERMES_FIRST_TOKEN_TIMEOUT` | `15.0` | Max wait for the first Hermes token (s) |
 | `RHV_HERMES_TURN_TIMEOUT` | `60.0` | Max wall time for one Hermes turn (s) |
 | `RHV_HERMES_STOP_TIMEOUT` | `3.0` | Bound on the mandatory `POST /v1/runs/{id}/stop` (s) |
-| `RHV_MAX_CONCURRENT_CALLS` | `5` | Adapter call semaphore; keep below Hermes `max_concurrent_runs` (default 10) |
+| `RHV_MAX_CONCURRENT_CALLS` | `5` | Adapter concurrent-call cap; keep below Hermes `max_concurrent_runs` (default 10) |
 | `RHV_MAX_TRANSCRIPT_UTTERANCES` | `200` | Transcript truncation (keeps most recent) |
 | `RHV_MAX_WS_MESSAGE_BYTES` | `1000000` | Inbound WS frame size cap, checked before JSON parse |
 | `RHV_SESSION_RETENTION` | `none` | `none` = per-call random session ids; `hermes` = let Hermes persist sessions |
@@ -233,7 +233,6 @@ All settings load from `RHV_`-prefixed environment variables or a `.env` file
 | `RHV_TOOL_POLICY__CONFIRM_TOOLS` | `[]` | Advisory: tools requiring spoken confirmation |
 | `RHV_TOOL_POLICY__MAX_TOOL_CALLS_PER_TURN` | `3` | Advisory per-turn tool budget |
 | `RHV_TOOL_POLICY__MAX_TOOL_SECONDS_PER_CALL` | `60.0` | Advisory per-call tool time budget |
-| `RHV_LOG_TRANSCRIPTS` | `false` | Never log call content unless explicitly enabled |
 
 ## Troubleshooting
 
@@ -243,7 +242,7 @@ All settings load from `RHV_`-prefixed environment variables or a `.env` file
 | 401 from Hermes | `RHV_HERMES_API_KEY` doesn't match `API_SERVER_KEY` in `~/.hermes/.env` (Hermes returns identical bodies for missing and wrong keys) |
 | Retell connects, then silence | Route secret mismatch (connection closed 1008 before events), or the config frame never reached Retell — verify the URL you configured includes the secret and that the proxy forwards WebSocket upgrades on `/llm-websocket` |
 | First call is very slow | Provider cold start (up to 24 s measured) — leave `RHV_WARMUP_ON_START=true` and wait for `/readyz` before routing traffic |
-| Caller hears "all lines are busy" | Adapter call semaphore full (`RHV_MAX_CONCURRENT_CALLS`), or Hermes is at `max_concurrent_runs` — note the Hermes cap is shared with all other API work |
+| Caller hears "all lines are busy" | Adapter concurrent-call cap reached (`RHV_MAX_CONCURRENT_CALLS`), or Hermes is at `max_concurrent_runs` — note the Hermes cap is shared with all other API work |
 | Agent speaks markdown artifacts | Should not happen (sanitizer); if it does, file a bug with the raw Hermes output |
 
 ## Testing

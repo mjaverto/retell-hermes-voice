@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from typing import Any
 
 import pytest
 
 from retell_hermes_voice.config import Settings, ToolPolicy
 from retell_hermes_voice.speech import (
+    MAX_SPOKEN_INPUT,
     VOICE_SYSTEM_PROMPT,
     DeltaSanitizer,
     FillerPicker,
@@ -142,6 +144,39 @@ def test_sanitize_idempotent() -> None:
     assert sanitize_spoken(once) == once
     plain = sanitize_spoken("Just a normal sentence, with 2 clauses.")
     assert sanitize_spoken(plain) == plain
+
+
+def test_sanitize_adversarial_fence_input_is_fast() -> None:
+    start = time.perf_counter()
+    out = sanitize_spoken("```" + "a" * 20000)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.2
+    assert "skip the technical details" in out
+    assert "a" * 100 not in out  # everything after the fence is code, dropped
+
+
+def test_sanitize_adversarial_link_input_is_fast() -> None:
+    start = time.perf_counter()
+    out = sanitize_spoken("[](" * 5000)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.2
+    assert "[](" in out  # not a link, passed through (whitespace-collapsed)
+
+
+def test_sanitize_truncates_oversized_input() -> None:
+    out = sanitize_spoken("word " * 4000)  # 20000 chars of plain prose
+    assert out.endswith("And there is more detail I can share if you want.")
+    assert len(out) <= MAX_SPOKEN_INPUT
+
+
+def test_sanitize_truncation_is_idempotent() -> None:
+    once = sanitize_spoken("word " * 4000)
+    assert sanitize_spoken(once) == once
+
+
+def test_sanitize_input_at_cap_untouched() -> None:
+    text = "a" * MAX_SPOKEN_INPUT
+    assert sanitize_spoken(text) == text
 
 
 # --- DeltaSanitizer ---

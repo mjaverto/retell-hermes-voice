@@ -40,11 +40,15 @@ def _call_ref(call_id: str) -> str:
 def create_app(
     settings: Settings, hermes_transport: httpx.AsyncBaseTransport | None = None
 ) -> FastAPI:
-    """Build the ASGI app; one HermesClient and one call semaphore per app.
+    """Build the ASGI app; one HermesClient and one call-slot counter per app.
 
     ``hermes_transport`` lets tests mount a fake Hermes backend in-process.
     """
-    call_slots = asyncio.Semaphore(settings.max_concurrent_calls)
+    # Plain counter, not a Semaphore: the busy check and the slot grab must be a
+    # single atomic step (no await between them), which locked()-then-acquire
+    # cannot guarantee. asyncio is single-threaded, so check+increment with no
+    # intervening await is race-free.
+    active_calls = 0
     config_frame = dump_outbound(
         ConfigOut(config=RetellConfig(auto_reconnect=True, call_details=True))
     )
@@ -62,12 +66,22 @@ def create_app(
         finally:
             if warmup_task is not None:
                 warmup_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
+                try:
                     await warmup_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.warning(
+                        "warmup cancel failed during shutdown error=%s", type(exc).__name__
+                    )
             sessions: set[CallSession] = app.state.sessions
             for session in list(sessions):
-                with contextlib.suppress(Exception):
+                try:
                     await session.close()
+                except Exception as exc:
+                    logger.warning(
+                        "session close failed during shutdown error=%s", type(exc).__name__
+                    )
             await hermes.aclose()
 
     app = FastAPI(lifespan=lifespan)
@@ -81,14 +95,19 @@ def create_app(
         hermes: HermesClient = app.state.hermes
         try:
             ready = await hermes.health()
-        except HermesUnavailableError:
+        except HermesUnavailableError as exc:
+            logger.warning("readiness check failed error=%s", type(exc).__name__)
             ready = False
+        else:
+            if not ready:
+                logger.warning("readiness check failed error=unhealthy_status")
         if ready:
             return JSONResponse({"status": "ready"})
         return JSONResponse({"status": "degraded"}, status_code=503)
 
     @app.websocket("/llm-websocket/{route_secret}/{call_id}")
     async def llm_websocket(websocket: WebSocket, route_secret: str, call_id: str) -> None:
+        nonlocal active_calls
         if not secrets.compare_digest(
             route_secret.encode(), settings.route_secret.get_secret_value().encode()
         ):
@@ -97,7 +116,7 @@ def create_app(
             await websocket.close(code=1008)
             logger.warning("ws rejected call=%s reason=bad_route_secret", _call_ref(call_id))
             return
-        if call_slots.locked():
+        if active_calls >= settings.max_concurrent_calls:
             await websocket.accept()
             await websocket.send_text(config_frame)
             await websocket.send_text(
@@ -110,7 +129,7 @@ def create_app(
             await websocket.close()
             logger.warning("ws rejected call=%s reason=busy", _call_ref(call_id))
             return
-        await call_slots.acquire()
+        active_calls += 1  # atomic with the capacity check above: no await between
         hermes: HermesClient = app.state.hermes
         sessions: set[CallSession] = app.state.sessions
         started = time.monotonic()
@@ -153,11 +172,23 @@ def create_app(
         finally:
             if session is not None:
                 sessions.discard(session)
-                with contextlib.suppress(Exception):
+                try:
                     await session.close()
+                except asyncio.CancelledError:
+                    # External cancellation (server shutdown, test-client teardown)
+                    # while draining cleanup: the session's background reaping tasks
+                    # keep running on the loop and still deliver the Hermes stop, so
+                    # absorbing here never orphans a run.
+                    logger.debug("session close interrupted call=%s", _call_ref(call_id))
+                except Exception as exc:
+                    logger.warning(
+                        "session close failed call=%s error=%s",
+                        _call_ref(call_id),
+                        type(exc).__name__,
+                    )
                 if session.outcome == "denied":
                     outcome = "denied"
-            call_slots.release()
+            active_calls -= 1
             duration_ms = int((time.monotonic() - started) * 1000)
             logger.info(
                 "call end call=%s duration_ms=%d turns=%d outcome=%s",
