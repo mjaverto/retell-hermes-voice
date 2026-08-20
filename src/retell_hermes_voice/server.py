@@ -10,6 +10,7 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
@@ -36,8 +37,13 @@ def _call_ref(call_id: str) -> str:
     return hashlib.sha256(call_id.encode()).hexdigest()[:12]
 
 
-def create_app(settings: Settings) -> FastAPI:
-    """Build the ASGI app; one HermesClient and one call semaphore per app."""
+def create_app(
+    settings: Settings, hermes_transport: httpx.AsyncBaseTransport | None = None
+) -> FastAPI:
+    """Build the ASGI app; one HermesClient and one call semaphore per app.
+
+    ``hermes_transport`` lets tests mount a fake Hermes backend in-process.
+    """
     call_slots = asyncio.Semaphore(settings.max_concurrent_calls)
     config_frame = dump_outbound(
         ConfigOut(config=RetellConfig(auto_reconnect=True, call_details=True))
@@ -45,7 +51,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        hermes = HermesClient(settings)
+        hermes = HermesClient(settings, transport=hermes_transport)
         app.state.hermes = hermes
         app.state.sessions = set()
         warmup_task: asyncio.Task[None] | None = None
