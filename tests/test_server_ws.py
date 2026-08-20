@@ -2,8 +2,8 @@
 
 Drives the real ASGI app (``create_app``) through ``starlette.testclient.TestClient``,
 with Hermes traffic routed into the programmable fake in ``tests/fake_hermes.py`` via
-``httpx.ASGITransport``. No network, no real Hermes, no sleeps beyond what a script's
-own ``delta_interval_s``/timeout settings require.
+``build_fake_hermes_transport``, which streams SSE bodies incrementally (unlike
+``httpx.ASGITransport``'s full-response buffering -- see that module's docstring).
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from fake_hermes import FakeHermesState, FakeScript, build_fake_hermes
+from fake_hermes import FakeHermesState, FakeScript, build_fake_hermes_transport
 from retell_hermes_voice.call_session import DENIED_LINE
 from retell_hermes_voice.config import Settings
 from retell_hermes_voice.hermes_client import SAFE_TIMEOUT_MESSAGE
@@ -56,9 +56,9 @@ def running_app(
     script: FakeScript, **settings_overrides: Any
 ) -> Iterator[tuple[TestClient, Settings, FakeHermesState]]:
     """Build a real app wired to a fake Hermes and run its lifespan for the block."""
-    fake_app, state = build_fake_hermes(script)
+    transport, state = build_fake_hermes_transport(script)
     settings = make_settings(**settings_overrides)
-    app = create_app(settings, hermes_transport=httpx.ASGITransport(app=fake_app))
+    app = create_app(settings, hermes_transport=transport)
     with TestClient(app) as client:
         yield client, settings, state
 

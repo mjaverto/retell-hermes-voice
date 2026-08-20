@@ -16,10 +16,9 @@ from collections.abc import Iterator
 from queue import Empty, Queue
 from typing import Any
 
-import httpx
 from starlette.testclient import TestClient
 
-from fake_hermes import FakeHermesState, FakeScript, build_fake_hermes
+from fake_hermes import FakeHermesState, FakeScript, build_fake_hermes_transport
 from retell_hermes_voice.config import Settings
 from retell_hermes_voice.server import create_app
 
@@ -48,9 +47,9 @@ def running_app(
     script: FakeScript, **settings_overrides: Any
 ) -> Iterator[tuple[TestClient, Settings, FakeHermesState]]:
     """Build a real app wired to a fake Hermes and run its lifespan for the block."""
-    fake_app, state = build_fake_hermes(script)
+    transport, state = build_fake_hermes_transport(script)
     settings = make_settings(**settings_overrides)
-    app = create_app(settings, hermes_transport=httpx.ASGITransport(app=fake_app))
+    app = create_app(settings, hermes_transport=transport)
     with TestClient(app) as client:
         yield client, settings, state
 
