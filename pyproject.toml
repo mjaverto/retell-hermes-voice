@@ -16,8 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.3,<9",
-    "pytest-asyncio>=0.24,<2",
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3,<2",
     "ruff>=0.6",
     "mypy>=1.11",
     "pip-audit>=2.7",
@@ -55,8 +55,8 @@ addopts = "-q"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.3,<9",
-    "pytest-asyncio>=0.24,<2",
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3,<2",
     "ruff>=0.6",
     "mypy>=1.11",
     "pip-audit>=2.7",

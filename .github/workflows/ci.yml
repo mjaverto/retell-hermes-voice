@@ -40,6 +40,8 @@ jobs:
       - name: Install
         run: |
           uv venv
-          uv pip install -e . pip-audit
+          uv pip install -e '.[dev]' pip-audit
       - name: Audit dependencies
-        run: uv run pip-audit --local --strict
+        run: |
+          uv pip freeze | grep -v '^-e ' > requirements-audit.txt
+          uv run pip-audit -r requirements-audit.txt --strict
