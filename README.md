@@ -115,9 +115,9 @@ curl -s https://api.retellai.com/create-agent \
 
 # Publish (PATCH /update-agent edits the DRAFT only; a publish is required
 # before phone traffic sees the change)
-curl -s -X POST https://api.retellai.com/publish-agent-version/<agent_id> \
+curl -s -X POST https://api.retellai.com/publish-agent/<agent_id> \
   -H "Authorization: Bearer $RETELL_API_KEY" -H "Content-Type: application/json" \
-  -d '{"version": <draft_version>}'
+  -d '{}'
 
 # Bind a phone number
 curl -s -X PATCH https://api.retellai.com/update-phone-number/+15551234567 \
