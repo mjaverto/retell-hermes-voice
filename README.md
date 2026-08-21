@@ -1,3 +1,12 @@
+> [!WARNING]
+> **DEPRECATED — this project is no longer maintained.**
+> It has been replaced by **[vapi-hermes-voice](https://github.com/mjaverto/vapi-hermes-voice)**,
+> the same Hermes voice bridge built on [Vapi](https://vapi.ai) instead of Retell
+> (voice-provider change, not a technical failure of this adapter). The Hermes-side
+> engineering — run lifecycle, speech sanitization, security posture, and the
+> verified Hermes wire contract in `docs/integration-contracts.md` — carries forward
+> there. This repository is archived and read-only.
+
 # retell-hermes-voice
 
 A Python 3.11 FastAPI adapter that bridges the [Retell AI](https://retellai.com)
