@@ -357,7 +357,7 @@ workspace, which currently contains zero agents and zero phone numbers.
 | Get agent | `GET /get-agent/{agent_id}` | `?version=` int, `latest`, `latest_published`, or tag |
 | Create agent | `POST /create-agent` | requires `response_engine` + `voice_id`; 201 + AgentResponse |
 | Update agent | `PATCH /update-agent/{agent_id}` | **edits the latest DRAFT only** — live/published calls are unaffected until publish; 412 = stale draft (re-GET and retry) |
-| Publish draft | `POST /publish-agent-version/{agent_id}` | body `{"version": <int>}` required; makes that draft live |
+| Publish draft | `POST /publish-agent/{agent_id}` | LIVE 200 (empty body accepted, `{}`). NOTE: `POST /publish-agent-version` — named in older docs — returns `Cannot POST` and does not exist |
 | List phone numbers | `GET /v2/list-phone-numbers` | LIVE 200 |
 | Create number | `POST /create-phone-number` | `area_code`, `number_provider` (default `twilio`), `inbound_agents`/`outbound_agents` arrays of `{agent_id, agent_version?, weight}` (weights sum to 1) |
 | Repoint number | `PATCH /update-phone-number/{e164}` | send only changed fields; inbound/outbound bindings independent; `agent_version` accepts int, `latest`, `latest_published`, or tag |
@@ -372,8 +372,17 @@ workspace, which currently contains zero agents and zero phone numbers.
 ```
 
 **Draft-vs-published nuance:** `PATCH /update-agent` + immediately `POST
-/publish-agent-version` is required for a websocket-URL change to take effect for phone
+/publish-agent/{agent_id}` is required for a websocket-URL change to take effect for phone
 traffic routed to a published version.
+
+**Deprecated phone-number fields (LIVE):** `create-phone-number` with the singular
+`inbound_agent_id` / `outbound_agent_id` fields now returns HTTP 400 `Deprecated API usage
+is no longer supported`. Use the plural arrays, and note `weight` is REQUIRED on each entry
+(omitting it returns 400 `must have required property 'weight'`).
+
+**Buying a number requires billing (LIVE):** `POST /create-phone-number` on a workspace with
+no payment method returns HTTP 402 `This item requires a card on file` after passing
+validation — provision billing before automating number purchase.
 
 **Concurrency (LIVE):** `base_concurrency: 20`, `concurrency_burst_enabled: true`,
 `concurrency_burst_limit: 60` (burst = min(3×limit, limit+300); calls 21–60 proceed at a
